@@ -145,7 +145,7 @@ function splitSentences(t) { return (t.match(/[^.!?]+[.!?]*["'”’]?\s*/g) || 
 let AUDIO_INDEX = null;
 const studioPlayer = new Audio(); studioPlayer.preload = 'auto';
 const clipUrls = new Map();
-fetch('audio/index.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null).then(j => {
+const audioIndexReady = fetch('audio/index.json', { cache: 'no-cache' }).then(r => r.ok ? r.json() : null).then(j => {
   if (j && j.files && Object.keys(j.files).length) AUDIO_INDEX = j.files;
   const st = document.getElementById('studioStatus'); if (st) st.textContent = studioStatus();
 }).catch(() => { });
@@ -158,27 +158,59 @@ async function clipUrl(file) {
   const r = await fetch('audio/' + file); if (!r.ok) throw new Error('missing clip');
   const u = URL.createObjectURL(await r.blob()); clipUrls.set(file, u); return u;
 }
-function playStudio(lines, onEnd, onProgress) {
+// opts.durs (clip lengths in seconds) lets playback start part-way through,
+// at opts.from seconds, and report progress by time rather than by line.
+function playStudio(lines, onEnd, onProgress, opts = {}) {
   stopSpeech();
-  const token = playToken; let i = 0;
+  const token = playToken, durs = opts.durs;
+  let i = 0, offset = 0, before = 0;
+  if (durs && opts.from > 0) {
+    let t = opts.from;
+    while (i < lines.length - 1 && t >= durs[i]) { t -= durs[i]; before += durs[i]; i++; }
+    offset = t;
+  }
+  const total = durs ? durs.reduce((x, y) => x + y, 0) : 0;
   const fallback = () => { if (token !== playToken) return; speakTTS(lines.slice(Math.max(0, i - 1)), onEnd, onProgress); };
   const next = async () => {
     if (token !== playToken) return;
     if (i >= lines.length) { onEnd && onEnd(true); return; }
-    const l = lines[i++];
+    const l = lines[i++], startAt = offset; offset = 0;
     try {
       const url = await clipUrl(AUDIO_INDEX[audioKey(l.s || 0, l.t)]);
       if (token !== playToken) return;
       const rate = Math.max(0.6, Math.min(1.5, SETTINGS.rate));
       studioPlayer.src = url; studioPlayer.defaultPlaybackRate = rate; studioPlayer.playbackRate = rate;
       try { studioPlayer.preservesPitch = true; } catch (e) { }
-      studioPlayer.onended = () => { if (token === playToken) setTimeout(next, i < lines.length ? 350 + Math.random() * 300 : 0); };
+      studioPlayer.onended = () => {
+        if (token !== playToken) return;
+        if (durs) before += durs[i - 1];
+        setTimeout(next, i < lines.length ? 350 + Math.random() * 300 : 0);
+      };
       studioPlayer.onerror = fallback;
-      studioPlayer.ontimeupdate = () => { if (token === playToken && onProgress && studioPlayer.duration) onProgress((i - 1 + studioPlayer.currentTime / studioPlayer.duration) / lines.length); };
+      studioPlayer.ontimeupdate = () => {
+        if (token !== playToken || !onProgress || !studioPlayer.duration) return;
+        onProgress(total ? (before + studioPlayer.currentTime) / total : (i - 1 + studioPlayer.currentTime / studioPlayer.duration) / lines.length);
+      };
+      if (startAt > 0) {
+        await new Promise(res => { if (studioPlayer.readyState >= 1) res(); else studioPlayer.addEventListener('loadedmetadata', res, { once: true }); });
+        if (token !== playToken) return;
+        studioPlayer.currentTime = startAt;
+      }
       await studioPlayer.play();
     } catch (e) { fallback(); }
   };
   next();
+}
+// The length of each recorded clip, for the seek bar.
+async function clipDurations(lines) {
+  return Promise.all(lines.map(async l => {
+    const url = await clipUrl(AUDIO_INDEX[audioKey(l.s || 0, l.t)]);
+    return new Promise(res => {
+      const a = new Audio(); a.preload = 'metadata';
+      a.onloadedmetadata = () => res(isFinite(a.duration) ? a.duration : 0); a.onerror = () => res(0);
+      a.src = url;
+    });
+  }));
 }
 async function saveAllAudio(btn, out) {
   if (!('caches' in window) || !AUDIO_INDEX) { out.textContent = 'There is no recorded audio to save yet.'; return; }
@@ -270,29 +302,90 @@ function fillVoiceSelects() {
   const tip = document.getElementById('voiceTip'); if (tip) tip.textContent = voiceTip();
 }
 
-// A play control that respects exam mode (one play only)
+// A play control that respects exam mode (one play only). With recorded
+// audio and no one-play limit it also gets a seek bar you can drag, a pause
+// button and 5-second skips, like a video player.
+let activePlayerReset = null; // so starting one player resets another that was playing
+const fmtTime = t => { t = Math.max(0, Math.round(t || 0)); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`; };
 function mountPlayer(el, lines, { label = '▶ Play audio', onFirstEnd, once = false } = {}) {
   let plays = 0, playing = false, firstDone = false;
+  let durs = null, total = 0, pos = 0, dragging = false;
   const single = () => once || SETTINGS.exam;
-  el.innerHTML = `<button class="btn" data-p="play">${label}</button><button class="btn ghost small" data-p="stop" hidden>■ Stop</button><span class="state"></span><div class="pbar" role="progressbar" aria-label="Audio progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>`;
+  const seekable = () => !!durs && total > 0 && !single();
+  el.innerHTML = `<button class="btn" data-p="play">${label}</button><button class="btn ghost small" data-p="stop" hidden>■ Stop</button><span class="state"></span>
+    <div class="pbar" role="progressbar" aria-label="Audio progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>
+    <div class="seek" hidden>
+      <button type="button" class="btn ghost small" data-p="back" aria-label="Back 5 seconds">↺ 5s</button>
+      <input type="range" class="seek-bar" min="0" max="1000" step="1" value="0" aria-label="Seek">
+      <button type="button" class="btn ghost small" data-p="fwd" aria-label="Forward 5 seconds">5s ↻</button>
+      <span class="seek-time">0:00 / 0:00</span>
+    </div>`;
   const play = $('[data-p=play]', el), stop = $('[data-p=stop]', el), state = $('.state', el), bar = $('.pbar', el), fill = $('.pbar i', el);
-  const setP = f => { const v = Math.round(Math.max(0, Math.min(1, f)) * 100); fill.style.width = v + '%'; bar.setAttribute('aria-valuenow', v); };
+  const seek = $('.seek', el), range = $('.seek-bar', el), time = $('.seek-time', el);
+  const showTime = t => { time.textContent = `${fmtTime(t)} / ${fmtTime(total)}`; };
+  const paintSeek = () => {
+    if (!dragging) range.value = total ? Math.round(1000 * pos / total) : 0;
+    range.style.setProperty('--pct', (total ? 100 * pos / total : 0) + '%');
+    showTime(dragging ? range.value / 1000 * total : pos);
+  };
+  const setP = f => {
+    f = Math.max(0, Math.min(1, f));
+    const v = Math.round(f * 100); fill.style.width = v + '%'; bar.setAttribute('aria-valuenow', v);
+    if (seekable()) { pos = f * total; paintSeek(); }
+  };
   const paint = () => {
+    const sk = seekable();
+    seek.hidden = !sk; bar.hidden = sk;
     play.hidden = playing; stop.hidden = !playing || once;
+    stop.textContent = sk ? '❚❚ Pause' : '■ Stop';
     if (single() && plays >= 1 && !playing) { play.disabled = true; play.textContent = 'Played'; }
+    else if (sk && pos > 0 && pos < total - 0.05) play.textContent = '▶ Resume';
     else if (plays >= 1) play.textContent = '↺ Play again';
     state.textContent = playing ? (once ? 'Playing… one time only' : 'Playing…') : (once ? (plays ? 'Finished' : 'You will hear it once') : SETTINGS.exam ? 'Exam mode: one listen only' : (plays ? `Played ${plays}×` : ''));
   };
-  play.addEventListener('click', () => {
-    plays++; playing = true; paint(); setP(0);
-    speak(lines, ok => {
-      playing = false; if (ok !== false) setP(1);
-      if (ok === false) { plays = Math.max(0, plays - 1); paint(); return; } // audio failed: allow another try
-      paint(); if (!firstDone) { firstDone = true; onFirstEnd && onFirstEnd(); }
-    }, setP);
+  const reset = () => { playing = false; paint(); };
+  const done = ok => {
+    playing = false; if (activePlayerReset === reset) activePlayerReset = null;
+    if (ok !== false) setP(1);
+    if (ok === false) { plays = Math.max(0, plays - 1); paint(); return; } // audio failed: allow another try
+    paint(); if (!firstDone) { firstDone = true; onFirstEnd && onFirstEnd(); }
+  };
+  const start = () => {
+    if (activePlayerReset && activePlayerReset !== reset) activePlayerReset();
+    activePlayerReset = reset;
+    const sk = seekable();
+    if (sk && pos >= total - 0.05) pos = 0;
+    if (!sk || pos === 0) plays++;
+    playing = true; paint(); if (!sk) setP(0);
+    if (sk && useStudio(lines)) playStudio(lines, done, setP, { durs, from: pos });
+    else speak(lines, done, setP);
+  };
+  // Move to a new point; keep playing if it was playing.
+  const jump = t => {
+    pos = Math.max(0, Math.min(total, t)); paintSeek();
+    if (playing) { if (pos >= total - 0.05) { stopSpeech(); done(true); } else playStudio(lines, done, setP, { durs, from: pos }); }
+    else paint();
+  };
+  play.addEventListener('click', start);
+  stop.addEventListener('click', () => {
+    stopSpeech(); playing = false; if (activePlayerReset === reset) activePlayerReset = null; paint();
+    if (!seekable() && !firstDone) { firstDone = true; onFirstEnd && onFirstEnd(); }
   });
-  stop.addEventListener('click', () => { stopSpeech(); playing = false; paint(); if (!firstDone) { firstDone = true; onFirstEnd && onFirstEnd(); } });
+  range.addEventListener('input', () => { dragging = true; range.style.setProperty('--pct', range.value / 10 + '%'); showTime(range.value / 1000 * total); });
+  range.addEventListener('change', () => { dragging = false; jump(range.value / 1000 * total); });
+  $('[data-p=back]', el).addEventListener('click', () => jump(pos - 5));
+  $('[data-p=fwd]', el).addEventListener('click', () => jump(pos + 5));
   paint();
+  // Recorded clips load in the background; once their lengths are known the
+  // seek bar appears (never in exam mode or on one-play recordings).
+  const prepare = () => {
+    if (single() || !useStudio(lines)) return;
+    clipDurations(lines).then(d => {
+      if (d.some(x => !x)) return;
+      durs = d; total = d.reduce((x, y) => x + y, 0); paintSeek(); paint();
+    }).catch(() => { });
+  };
+  if (AUDIO_INDEX) prepare(); else audioIndexReady.then(prepare);
 }
 
 // ---------- Claude (optional, with your own Anthropic API key) ----------

@@ -1,6 +1,6 @@
 // Offline support. App files: network first (so updates arrive when online),
 // cached copy when offline. Audio clips and fonts: cached copy first.
-const SHELL_CACHE = 'topik-shell-v1';
+const SHELL_CACHE = 'topik-shell-v2';
 const AUDIO_CACHE = 'topik-audio';
 const FONT_CACHE = 'topik-fonts';
 const SHELL = ['./', 'index.html', 'app.js', 'audio-key.js', 'data/content.js', 'data/words.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'audio/index.json'];
